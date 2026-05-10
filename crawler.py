@@ -18,7 +18,6 @@ NEXT_DATA_RE = re.compile(
     re.IGNORECASE,
 )
 
-# 你现在要一起跑的联赛
 LEAGUES = [
     {
         "name": "Premier League",
@@ -73,6 +72,10 @@ def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
+def normalize_team_name(s: str) -> str:
+    return re.sub(r"\s+", " ", s.replace("-", " ").strip()).title()
+
+
 def get_html(session: requests.Session, url: str, retry: int = 7, timeout: int = 45) -> str:
     last_err = None
     for i in range(retry):
@@ -93,16 +96,8 @@ def extract_next_data(html: str) -> dict:
     return json.loads(m.group(1))
 
 
-def normalize_team_name(s: str) -> str:
-    return re.sub(r"\s+", " ", s.replace("-", " ").strip()).title()
-
-
 def parse_teams_from_club_html(html: str, team_whitelist: set) -> List[Tuple[str, str, str]]:
-    """
-    从联赛页源码中提取 /team/{slug}/{id}
-    返回: [(team_name, slug, team_id), ...]
-    """
-    paths = sorted(set(re.findall(r'href="(/team/([A-Za-z0-9\-]+)/([A-Za-z0-9]+))"', html)))
+    paths = sorted(set(re.findall(r'href="(/team/([A-Za-z0-9\\-]+)/([A-Za-z0-9]+))"', html)))
     teams = []
     for _, slug, team_id in paths:
         team_name = normalize_team_name(slug)
@@ -149,7 +144,6 @@ def download_one_product(session: requests.Session, url: str, path: Path) -> Tup
     if path.exists():
         return 0, 0
 
-    # 第1次
     try:
         html = get_html(session, url)
         path.write_text(html, encoding="utf-8")
@@ -157,7 +151,6 @@ def download_one_product(session: requests.Session, url: str, path: Path) -> Tup
     except Exception:
         pass
 
-    # 第2次重试
     try:
         time.sleep(1.2)
         html = get_html(session, url)
@@ -195,7 +188,6 @@ def handle_category(
         "note": "",
     }
 
-    # 跳过 category_id=0
     if category_id == "0":
         result["mode"] = "SKIP_CATEGORY_0"
         result["note"] = "skip category_id=0"
@@ -207,7 +199,7 @@ def handle_category(
     category_path = f"/team/{team_slug}/{team_id}/category-{category_id}"
     category_url = f"{BASE}{category_path}"
 
-    # 先收集一遍球队页 data（无 More 时也有价值）
+    # 第一步：先抓球队页里的 data
     discovered: Dict[str, Dict[str, str]] = {}
     discovered.update(build_product_map_from_items(category.get("data") or []))
 
@@ -217,7 +209,7 @@ def handle_category(
     limit = 20
     pages = 1
 
-    # 再尝试进入类目完整页
+    # 第二步：再尝试进入完整类目页
     try:
         first_html = get_html(session, category_url)
         first_data = extract_next_data(first_html)
@@ -228,14 +220,11 @@ def handle_category(
         limit = int(page_param.get("limit", 20) or 20)
         pages = max(1, int(math.ceil(total / float(limit)))) if total > 0 else 1
 
-        # 第1页 productList
         discovered.update(build_product_map_from_items(first_pp.get("productList") or []))
 
-        # 兜底：如果 productList 没拿到，再从 html 提取
         if not (first_pp.get("productList") or []):
             discovered.update(collect_products_fallback_from_html(first_html))
 
-        # 后续分页
         for p in range(2, pages + 1):
             page_url = f"{category_url}/page-{p}"
             try:
@@ -260,16 +249,14 @@ def handle_category(
                     }
                 )
     except Exception as e:
-        # 如果类目页打不开，但 category.data 里有东西，也继续下载
+        # 完整页打不开，也不放弃，至少保留球队页 data
         if not discovered:
             result["mode"] = "CATEGORY_FAIL"
             result["note"] = str(e)
             return result
 
-    # 只保留目标类目发现的商品
     result["discovered_products"] = str(len(discovered))
 
-    # 下载商品页
     downloaded = 0
     failed = 0
     items = list(discovered.items())
@@ -300,13 +287,16 @@ def handle_category(
             downloaded += d
             failed += f
 
-    # 清理非白名单 html
     expected_names = {
         product_filename(meta["alias"], pid) for pid, meta in discovered.items()
     }
     for f in category_folder.glob("*.html"):
         if f.name not in expected_names:
             f.unlink(missing_ok=True)
+
+    # 不再保留 links.txt 作为主结果
+    for txt in category_folder.glob("links.txt"):
+        txt.unlink(missing_ok=True)
 
     remain = len(list(category_folder.glob("productdetail-*.html")))
     result["downloaded"] = str(downloaded)
@@ -319,22 +309,6 @@ def handle_category(
     if remain != len(discovered):
         note_parts.append(f"remain({remain})!=discovered({len(discovered)})")
     result["note"] = "; ".join(note_parts)
-
-    # 写每个类目的链接清单
-    links_txt = category_folder / "links.txt"
-    lines = [
-        f"LEAGUE={league_name}",
-        f"TEAM={team_name}",
-        f"CATEGORY={category_title}",
-        f"CATEGORY_ID={category_id}",
-        f"CATEGORY_URL={category_url}",
-        f"EXPECTED_TOTAL={total}",
-        f"DISCOVERED={len(discovered)}",
-        "",
-    ]
-    for pid, meta in sorted(discovered.items(), key=lambda x: int(x[0])):
-        lines.append(meta["url"])
-    links_txt.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     return result
 
@@ -355,7 +329,6 @@ def main() -> None:
         league_folder = OUTPUT_DIR / sanitize_name(league_name)
         ensure_dir(league_folder)
 
-        # 联赛页 html
         club_html = get_html(session, club_url)
         club_path_parts = club_url.rstrip("/").split("/")
         club_file_name = club_path_parts[-2] + "-" + club_path_parts[-1] + ".html"
@@ -413,7 +386,6 @@ def main() -> None:
                 )
                 continue
 
-            # 建一个 title -> category 的映射，避免类目缺失不明不白
             category_map = {}
             for c in categories:
                 title = str(c.get("title", "")).strip()
@@ -459,7 +431,6 @@ def main() -> None:
                 )
                 summary_rows.append(row)
 
-    # 输出汇总
     summary_csv = OUTPUT_DIR / "run-summary.csv"
     summary_txt = OUTPUT_DIR / "run-summary.txt"
     missing_csv = OUTPUT_DIR / "missing-categories.csv"
