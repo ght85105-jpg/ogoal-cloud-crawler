@@ -10,7 +10,6 @@ from typing import Dict, List, Tuple
 import requests
 
 BASE = "https://www.gogoalshop.se"
-CLUB_URL = "https://www.gogoalshop.se/club/Premier-League/645"
 OUTPUT_DIR = Path("output")
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -19,18 +18,51 @@ NEXT_DATA_RE = re.compile(
     re.IGNORECASE,
 )
 
-# 可选：只抓这 9 个队。设为空 set() 表示抓联赛页里全部队伍
-TEAM_WHITELIST = {
-    "Manchester United",
-    "Liverpool",
-    "Chelsea",
-    "Manchester City",
-    "Arsenal",
-    "Tottenham Hotspur",
-    "West Ham United",
-    "Newcastle United",
-    "Aston Villa",
-}
+# 你现在要一起跑的联赛
+LEAGUES = [
+    {
+        "name": "Premier League",
+        "club_url": "https://www.gogoalshop.se/club/Premier-League/645",
+        "teams": {
+            "Manchester United",
+            "Liverpool",
+            "Chelsea",
+            "Manchester City",
+            "Arsenal",
+            "Tottenham Hotspur",
+            "West Ham United",
+            "Newcastle United",
+            "Aston Villa",
+        },
+    },
+    {
+        "name": "La Liga",
+        "club_url": "https://www.gogoalshop.se/club/La-Liga/646",
+        "teams": {
+            "Barcelona",
+            "Real Madrid",
+            "Atletico Madrid",
+            "Valencia",
+            "Sevilla",
+            "Real Betis",
+            "Athletic Club De Bilbao",
+            "Celta Vigo",
+            "Rcd Espanyol",
+            "Rcd Mallorca",
+            "Real Sociedad",
+            "Real Zaragoza",
+            "Malaga",
+        },
+    },
+]
+
+TARGET_CATEGORIES = [
+    "Fan Jerseys",
+    "Player Version Jerseys",
+    "Retro Jerseys",
+    "Kids Jerseys",
+    "Women Jerseys",
+]
 
 
 def sanitize_name(s: str) -> str:
@@ -50,7 +82,7 @@ def get_html(session: requests.Session, url: str, retry: int = 7, timeout: int =
             return r.text
         except Exception as e:
             last_err = e
-            time.sleep(1.3 * (i + 1))
+            time.sleep(1.2 * (i + 1))
     raise RuntimeError(f"GET failed: {url} | {last_err}")
 
 
@@ -61,27 +93,29 @@ def extract_next_data(html: str) -> dict:
     return json.loads(m.group(1))
 
 
-def parse_teams_from_club_html(html: str) -> List[Tuple[str, str, str]]:
+def normalize_team_name(s: str) -> str:
+    return re.sub(r"\s+", " ", s.replace("-", " ").strip()).title()
+
+
+def parse_teams_from_club_html(html: str, team_whitelist: set) -> List[Tuple[str, str, str]]:
     """
     从联赛页源码中提取 /team/{slug}/{id}
     返回: [(team_name, slug, team_id), ...]
     """
-    # 只匹配真正 team 链接，避免 /team/xxx.gif 这种资源链接
     paths = sorted(set(re.findall(r'href="(/team/([A-Za-z0-9\-]+)/([A-Za-z0-9]+))"', html)))
     teams = []
-    for full_path, slug, team_id in paths:
-        team_name = slug.replace("-", " ").strip()
+    for _, slug, team_id in paths:
+        team_name = normalize_team_name(slug)
         teams.append((team_name, slug, team_id))
 
-    # 去重
     uniq = {}
     for t in teams:
         uniq[(t[1], t[2])] = t
     teams = list(uniq.values())
 
-    if TEAM_WHITELIST:
-        allow = {x.lower().strip() for x in TEAM_WHITELIST}
-        teams = [t for t in teams if t[0].lower() in allow]
+    if team_whitelist:
+        allow = {normalize_team_name(x) for x in team_whitelist}
+        teams = [t for t in teams if normalize_team_name(t[0]) in allow]
 
     return teams
 
@@ -90,25 +124,20 @@ def product_filename(alias_title: str, product_id: str) -> str:
     return sanitize_name(f"productdetail-{alias_title}-{product_id}.html")
 
 
-def collect_products_from_page_props(page_props: dict) -> Dict[str, Dict[str, str]]:
-    """
-    从 pageProps.productList 提取商品
-    返回: {product_id: {"alias":..., "url":...}}
-    """
+def build_product_map_from_items(items: List[dict]) -> Dict[str, Dict[str, str]]:
     out: Dict[str, Dict[str, str]] = {}
-    plist = page_props.get("productList") or []
-    for it in plist:
+    for it in items or []:
         alias = str(it.get("alias_title", "")).strip()
         pid = str(it.get("product_id", "")).strip()
         if alias and pid:
-            out[pid] = {"alias": alias, "url": f"{BASE}/productdetail/{alias}/{pid}"}
+            out[pid] = {
+                "alias": alias,
+                "url": f"{BASE}/productdetail/{alias}/{pid}",
+            }
     return out
 
 
 def collect_products_fallback_from_html(html: str) -> Dict[str, Dict[str, str]]:
-    """
-    兜底：从 html 里直接提取 /productdetail/{alias}/{id}
-    """
     out: Dict[str, Dict[str, str]] = {}
     matches = re.findall(r'href="(/productdetail/([^"/]+(?:-[^"/]+)*)/([0-9]+))"', html)
     for path, alias, pid in matches:
@@ -116,27 +145,45 @@ def collect_products_fallback_from_html(html: str) -> Dict[str, Dict[str, str]]:
     return out
 
 
-def download_products_for_category(
+def download_one_product(session: requests.Session, url: str, path: Path) -> Tuple[int, int]:
+    if path.exists():
+        return 0, 0
+
+    # 第1次
+    try:
+        html = get_html(session, url)
+        path.write_text(html, encoding="utf-8")
+        return 1, 0
+    except Exception:
+        pass
+
+    # 第2次重试
+    try:
+        time.sleep(1.2)
+        html = get_html(session, url)
+        path.write_text(html, encoding="utf-8")
+        return 1, 0
+    except Exception:
+        return 0, 1
+
+
+def handle_category(
     session: requests.Session,
+    league_name: str,
+    team_name: str,
     team_slug: str,
     team_id: str,
     category: dict,
     team_folder: Path,
-    max_workers: int = 12,
+    retry_failures: List[Dict[str, str]],
 ) -> Dict[str, str]:
-    """
-    按源码分页全量抓一个类目，并下载商品详情页
-    """
-    category_title = str(category.get("title", "Unknown")).strip() or "Unknown"
+    category_title = str(category.get("title", "")).strip() or "Unknown"
     category_id = str(category.get("category_id", "")).strip()
     category_count = int(category.get("count", 0) or 0)
-    category_folder = team_folder / sanitize_name(f"{team_folder.name} {category_title}")
-    ensure_dir(category_folder)
-
-    category_path = f"/team/{team_slug}/{team_id}/category-{category_id}"
-    category_url = f"{BASE}{category_path}"
 
     result = {
+        "league": league_name,
+        "team": team_name,
         "category": category_title,
         "mode": "FULL",
         "category_id": category_id,
@@ -148,83 +195,114 @@ def download_products_for_category(
         "note": "",
     }
 
+    # 跳过 category_id=0
+    if category_id == "0":
+        result["mode"] = "SKIP_CATEGORY_0"
+        result["note"] = "skip category_id=0"
+        return result
+
+    category_folder = team_folder / sanitize_name(f"{team_name} {category_title}")
+    ensure_dir(category_folder)
+
+    category_path = f"/team/{team_slug}/{team_id}/category-{category_id}"
+    category_url = f"{BASE}{category_path}"
+
+    # 先收集一遍球队页 data（无 More 时也有价值）
+    discovered: Dict[str, Dict[str, str]] = {}
+    discovered.update(build_product_map_from_items(category.get("data") or []))
+
+    first_html = ""
+    first_pp = {}
+    total = category_count
+    limit = 20
+    pages = 1
+
+    # 再尝试进入类目完整页
     try:
         first_html = get_html(session, category_url)
         first_data = extract_next_data(first_html)
         first_pp = first_data.get("props", {}).get("pageProps", {})
+        page_param = first_pp.get("pageParam", {}) or {}
+
+        total = int(page_param.get("total", category_count) or category_count or 0)
+        limit = int(page_param.get("limit", 20) or 20)
+        pages = max(1, int(math.ceil(total / float(limit)))) if total > 0 else 1
+
+        # 第1页 productList
+        discovered.update(build_product_map_from_items(first_pp.get("productList") or []))
+
+        # 兜底：如果 productList 没拿到，再从 html 提取
+        if not (first_pp.get("productList") or []):
+            discovered.update(collect_products_fallback_from_html(first_html))
+
+        # 后续分页
+        for p in range(2, pages + 1):
+            page_url = f"{category_url}/page-{p}"
+            try:
+                h = get_html(session, page_url)
+                d = extract_next_data(h)
+                pp = d.get("props", {}).get("pageProps", {})
+                page_items = pp.get("productList") or []
+                page_map = build_product_map_from_items(page_items)
+
+                if not page_map:
+                    page_map = collect_products_fallback_from_html(h)
+
+                discovered.update(page_map)
+            except Exception as e:
+                retry_failures.append(
+                    {
+                        "league": league_name,
+                        "team": team_name,
+                        "category": category_title,
+                        "url": page_url,
+                        "reason": f"page fetch failed: {e}",
+                    }
+                )
     except Exception as e:
-        result["mode"] = "CATEGORY_FAIL"
-        result["note"] = str(e)
-        return result
+        # 如果类目页打不开，但 category.data 里有东西，也继续下载
+        if not discovered:
+            result["mode"] = "CATEGORY_FAIL"
+            result["note"] = str(e)
+            return result
 
-    page_param = first_pp.get("pageParam", {}) or {}
-    total = int(page_param.get("total", category_count) or category_count or 0)
-    limit = int(page_param.get("limit", 20) or 20)
-    pages = max(1, int(math.ceil(total / float(limit)))) if total > 0 else 1
+    # 只保留目标类目发现的商品
+    result["discovered_products"] = str(len(discovered))
 
-    all_products: Dict[str, Dict[str, str]] = {}
+    # 下载商品页
+    downloaded = 0
+    failed = 0
+    items = list(discovered.items())
 
-    # 第1页
-    all_products.update(collect_products_from_page_props(first_pp))
-    # 兜底提取
-    if not all_products:
-        all_products.update(collect_products_fallback_from_html(first_html))
-
-    # 后续分页
-    for p in range(2, pages + 1):
-        page_url = f"{category_url}/page-{p}"
-        try:
-            h = get_html(session, page_url)
-            d = extract_next_data(h)
-            pp = d.get("props", {}).get("pageProps", {})
-            page_products = collect_products_from_page_props(pp)
-            if not page_products:
-                page_products = collect_products_fallback_from_html(h)
-            all_products.update(page_products)
-        except Exception:
-            # 某一页失败不立刻中断，后面通过校验体现差异
-            continue
-
-    # 如果发现数量仍偏少，再用 teamCategoryList.data 兜底补一层
-    data_items = category.get("data") or []
-    for it in data_items:
-        alias = str(it.get("alias_title", "")).strip()
-        pid = str(it.get("product_id", "")).strip()
-        if alias and pid:
-            all_products[pid] = {"alias": alias, "url": f"{BASE}/productdetail/{alias}/{pid}"}
-
-    discovered = len(all_products)
-    result["discovered_products"] = str(discovered)
-
-    # 下载商品详情页
-    def _task(item: Tuple[str, Dict[str, str]]) -> Tuple[int, int]:
+    def _task(item):
         pid, meta = item
         alias = meta["alias"]
         url = meta["url"]
         fname = product_filename(alias, pid)
         fpath = category_folder / fname
-        if fpath.exists():
-            return 0, 0
-        try:
-            ph = get_html(session, url)
-            fpath.write_text(ph, encoding="utf-8")
-            return 1, 0
-        except Exception:
-            return 0, 1
+        d, f = download_one_product(session, url, fpath)
+        if f:
+            retry_failures.append(
+                {
+                    "league": league_name,
+                    "team": team_name,
+                    "category": category_title,
+                    "url": url,
+                    "reason": "product download failed after retry",
+                }
+            )
+        return d, f
 
-    downloaded = 0
-    failed = 0
-    items = list(all_products.items())
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    with ThreadPoolExecutor(max_workers=12) as ex:
         futures = [ex.submit(_task, it) for it in items]
         for fu in as_completed(futures):
             d, f = fu.result()
             downloaded += d
             failed += f
 
-    # 只保留商品详情页 html（避免脏文件）
+    # 清理非白名单 html
     expected_names = {
-        product_filename(meta["alias"], pid) for pid, meta in all_products.items()
+        product_filename(meta["alias"], pid) for pid, meta in discovered.items()
     }
     for f in category_folder.glob("*.html"):
         if f.name not in expected_names:
@@ -235,25 +313,26 @@ def download_products_for_category(
     result["failed"] = str(failed)
     result["remain"] = str(remain)
 
-    # 审计 note
-    note = []
-    if total > 0 and discovered != total:
-        note.append(f"discovered({discovered})!=total({total})")
-    if remain != discovered:
-        note.append(f"remain({remain})!=discovered({discovered})")
-    result["note"] = "; ".join(note)
+    note_parts = []
+    if total and len(discovered) != total:
+        note_parts.append(f"discovered({len(discovered)})!=total({total})")
+    if remain != len(discovered):
+        note_parts.append(f"remain({remain})!=discovered({len(discovered)})")
+    result["note"] = "; ".join(note_parts)
 
-    # 写每类目链接清单（便于复核）
+    # 写每个类目的链接清单
     links_txt = category_folder / "links.txt"
     lines = [
+        f"LEAGUE={league_name}",
+        f"TEAM={team_name}",
         f"CATEGORY={category_title}",
         f"CATEGORY_ID={category_id}",
         f"CATEGORY_URL={category_url}",
-        f"TOTAL={total}",
-        f"DISCOVERED={discovered}",
+        f"EXPECTED_TOTAL={total}",
+        f"DISCOVERED={len(discovered)}",
         "",
     ]
-    for pid, meta in sorted(all_products.items(), key=lambda x: int(x[0])):
+    for pid, meta in sorted(discovered.items(), key=lambda x: int(x[0])):
         lines.append(meta["url"])
     links_txt.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -265,73 +344,129 @@ def main() -> None:
     session = requests.Session()
 
     summary_rows: List[Dict[str, str]] = []
+    missing_rows: List[Dict[str, str]] = []
+    retry_failures: List[Dict[str, str]] = []
 
-    # 1) 联赛页拿队伍
-    club_html = get_html(session, CLUB_URL)
-    teams = parse_teams_from_club_html(club_html)
+    for league in LEAGUES:
+        league_name = league["name"]
+        club_url = league["club_url"]
+        team_whitelist = league["teams"]
 
-    if not teams:
-        raise RuntimeError("联赛页没有解析到任何队伍，请检查链接或源码结构")
+        league_folder = OUTPUT_DIR / sanitize_name(league_name)
+        ensure_dir(league_folder)
 
-    for team_name_raw, slug, team_id in teams:
-        team_name = team_name_raw.title()
-        team_folder = OUTPUT_DIR / sanitize_name(team_name)
-        ensure_dir(team_folder)
+        # 联赛页 html
+        club_html = get_html(session, club_url)
+        club_path_parts = club_url.rstrip("/").split("/")
+        club_file_name = club_path_parts[-2] + "-" + club_path_parts[-1] + ".html"
+        (league_folder / club_file_name).write_text(club_html, encoding="utf-8")
 
-        # 下载 team 页源码
-        team_url = f"{BASE}/team/{slug}/{team_id}"
-        try:
-            team_html = get_html(session, team_url)
-            team_html_path = team_folder / f"team-{slug}-{team_id}.html"
-            team_html_path.write_text(team_html, encoding="utf-8")
-            team_data = extract_next_data(team_html)
-            page_props = team_data.get("props", {}).get("pageProps", {})
-            categories = page_props.get("teamCategoryList") or []
-        except Exception as e:
+        teams = parse_teams_from_club_html(club_html, team_whitelist)
+
+        if not teams:
             summary_rows.append(
                 {
-                    "team": team_name,
+                    "league": league_name,
+                    "team": "-",
                     "category": "-",
-                    "mode": "TEAM_FAIL",
+                    "mode": "NO_TEAMS",
                     "category_id": "-",
                     "expected_total": "0",
                     "discovered_products": "0",
                     "downloaded": "0",
                     "failed": "0",
                     "remain": "0",
-                    "note": str(e),
+                    "note": "No teams parsed from club page",
                 }
             )
             continue
 
-        if not categories:
-            summary_rows.append(
-                {
-                    "team": team_name,
-                    "category": "-",
-                    "mode": "NO_CATEGORY",
-                    "category_id": "-",
-                    "expected_total": "0",
-                    "discovered_products": "0",
-                    "downloaded": "0",
-                    "failed": "0",
-                    "remain": "0",
-                    "note": "teamCategoryList empty",
-                }
-            )
-            continue
+        for team_name, slug, team_id in teams:
+            team_folder = league_folder / sanitize_name(team_name)
+            ensure_dir(team_folder)
 
-        # 2) 抓该队全部类目（不再只抓固定5类）
-        for cat in categories:
-            row = download_products_for_category(session, slug, team_id, cat, team_folder)
-            row["team"] = team_name
-            summary_rows.append(row)
+            team_url = f"{BASE}/team/{slug}/{team_id}"
 
-    # 3) 输出汇总 CSV + txt
-    csv_path = OUTPUT_DIR / "run-summary.csv"
-    txt_path = OUTPUT_DIR / "run-summary.txt"
+            try:
+                team_html = get_html(session, team_url)
+                team_file = team_folder / f"team-{slug}-{team_id}.html"
+                team_file.write_text(team_html, encoding="utf-8")
+
+                team_data = extract_next_data(team_html)
+                page_props = team_data.get("props", {}).get("pageProps", {})
+                categories = page_props.get("teamCategoryList") or []
+            except Exception as e:
+                summary_rows.append(
+                    {
+                        "league": league_name,
+                        "team": team_name,
+                        "category": "-",
+                        "mode": "TEAM_FAIL",
+                        "category_id": "-",
+                        "expected_total": "0",
+                        "discovered_products": "0",
+                        "downloaded": "0",
+                        "failed": "0",
+                        "remain": "0",
+                        "note": str(e),
+                    }
+                )
+                continue
+
+            # 建一个 title -> category 的映射，避免类目缺失不明不白
+            category_map = {}
+            for c in categories:
+                title = str(c.get("title", "")).strip()
+                if title:
+                    category_map[title] = c
+
+            for wanted in TARGET_CATEGORIES:
+                if wanted not in category_map:
+                    missing_rows.append(
+                        {
+                            "league": league_name,
+                            "team": team_name,
+                            "category": wanted,
+                            "reason": "category not found in teamCategoryList",
+                        }
+                    )
+                    summary_rows.append(
+                        {
+                            "league": league_name,
+                            "team": team_name,
+                            "category": wanted,
+                            "mode": "MISSING_CATEGORY",
+                            "category_id": "-",
+                            "expected_total": "0",
+                            "discovered_products": "0",
+                            "downloaded": "0",
+                            "failed": "0",
+                            "remain": "0",
+                            "note": "category not found in teamCategoryList",
+                        }
+                    )
+                    continue
+
+                row = handle_category(
+                    session=session,
+                    league_name=league_name,
+                    team_name=team_name,
+                    team_slug=slug,
+                    team_id=team_id,
+                    category=category_map[wanted],
+                    team_folder=team_folder,
+                    retry_failures=retry_failures,
+                )
+                summary_rows.append(row)
+
+    # 输出汇总
+    summary_csv = OUTPUT_DIR / "run-summary.csv"
+    summary_txt = OUTPUT_DIR / "run-summary.txt"
+    missing_csv = OUTPUT_DIR / "missing-categories.csv"
+    retry_csv = OUTPUT_DIR / "retry-failures.csv"
 
     fields = [
+        "league",
         "team",
         "category",
         "mode",
@@ -343,7 +478,8 @@ def main() -> None:
         "remain",
         "note",
     ]
-    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+
+    with summary_csv.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in summary_rows:
@@ -352,14 +488,24 @@ def main() -> None:
     lines = ["|".join(fields)]
     for r in summary_rows:
         lines.append("|".join(str(r.get(k, "")) for k in fields))
-    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    summary_txt.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    # 控制台输出简报
-    total_cat = len(summary_rows)
+    with missing_csv.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=["league", "team", "category", "reason"])
+        w.writeheader()
+        for r in missing_rows:
+            w.writerow(r)
+
+    with retry_csv.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=["league", "team", "category", "url", "reason"])
+        w.writeheader()
+        for r in retry_failures:
+            w.writerow(r)
+
     total_remain = sum(int(r.get("remain", "0") or 0) for r in summary_rows)
     total_failed = sum(int(r.get("failed", "0") or 0) for r in summary_rows)
-    print(f"完成：类目={total_cat} | 商品HTML总数={total_remain} | 下载失败={total_failed}")
-    print(f"汇总文件：{csv_path} / {txt_path}")
+    print(f"完成：联赛={len(LEAGUES)} | 类目行={len(summary_rows)} | 商品HTML总数={total_remain} | 下载失败={total_failed}")
+    print(f"输出目录：{OUTPUT_DIR.resolve()}")
 
 
 if __name__ == "__main__":
