@@ -1,0 +1,30 @@
+name: 云端抓取任务
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: 拉代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 执行抓取
+        run: python crawler.py
+
+      - name: 上传结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: gogoal-output
+          path: output
